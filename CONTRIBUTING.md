@@ -808,7 +808,7 @@ deterministic test to narrow it down.
 
 ### Fuzzing
 
-The full story lives in [docs/fuzzing.md](docs/fuzzing.md): the six targets and
+The full story lives in [docs/fuzzing.md](docs/fuzzing.md): the eight targets and
 the property each asserts, the nightly `continuous-fuzz` workflow that runs them
 beyond CI's time budget, and the crash-to-regression-seed process. What follows
 is what you need while working.
@@ -820,7 +820,7 @@ make fuzz               # every target, 30s each (override: make fuzz FUZZTIME=2
 go run ./cmd/gencorpus  # regenerate the seed corpus from the golden vectors
 ```
 
-#### The six fuzz targets
+#### The eight fuzz targets
 
 | Target                         | Package            | Run command                                                                  |
 | ------------------------------ | ------------------ | ---------------------------------------------------------------------------- |
@@ -829,9 +829,11 @@ go run ./cmd/gencorpus  # regenerate the seed corpus from the golden vectors
 | `FuzzPreimage`                 | root (`.`)         | `go test -run '^$' -fuzz FuzzPreimage -fuzztime 30s .`                       |
 | `FuzzPayload`                  | root (`.`)         | `go test -run '^$' -fuzz FuzzPayload -fuzztime 30s .`                        |
 | `FuzzDecodeAuthorizationEntry` | root (`.`)         | `go test -run '^$' -fuzz FuzzDecodeAuthorizationEntry -fuzztime 30s .`       |
+| `FuzzVerifyEntry`              | root (`.`)         | `go test -run '^$' -fuzz FuzzVerifyEntry -fuzztime 30s .`                    |
+| `FuzzDiffEntries`              | root (`.`)         | `go test -run '^$' -fuzz FuzzDiffEntries -fuzztime 30s .`                    |
 | `FuzzCopyRoundTrip`            | `internal/xdrcopy` | `go test -run '^$' -fuzz FuzzCopyRoundTrip -fuzztime 30s ./internal/xdrcopy` |
 
-Run all six with one command:
+Run all eight with one command:
 
 ```sh
 make fuzz                       # 30s each
@@ -840,12 +842,14 @@ make fuzz FUZZTIME=2m           # 2 minutes each
 
 #### Seed corpus location
 
-The seed corpus lives in `testdata/fuzz/<TargetName>/` for the five root-package
-targets, and in `internal/xdrcopy/testdata/fuzz/FuzzCopyRoundTrip/` for
-`FuzzCopyRoundTrip`. Go reads a target's seeds **only** from its dedicated
+The seed corpus lives in `testdata/fuzz/<TargetName>/` for the seven
+root-package targets, and in `internal/xdrcopy/testdata/fuzz/FuzzCopyRoundTrip/`
+for `FuzzCopyRoundTrip`. Go reads a target's seeds **only** from its dedicated
 directory; files elsewhere are ignored. Every file must be in Go's corpus format
 (a `go test fuzz v1` header followed by one Go literal per fuzz argument). A
 file in the wrong format fails the package's tests rather than being skipped.
+`FuzzDiffEntries` is the one target whose seeds carry two `[]byte` literals, one
+per argument.
 
 Regenerate the seeds from the committed golden vectors:
 

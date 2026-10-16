@@ -27,7 +27,10 @@
 //     before rewriting. Anything else in the seed directory is left alone.
 //
 // The seed is the decoded entry, not the base64 text, because the target's
-// argument is the []byte it hands to UnmarshalBinary.
+// argument is the []byte it hands to UnmarshalBinary. The one two-input target,
+// FuzzDiffEntries, gets a pair of decoded entries per seed — the entry against
+// itself, and against a tampered variant — written by the same generator so the
+// pair corpus is held to the same drift check as the rest.
 //
 // It also writes testdata/wasm-parity/fuzz_expectations.json: the native result
 // for every seed, which wasm/parity.mjs replays the wasm build against. The wasm
@@ -47,6 +50,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -83,21 +87,32 @@ const (
 )
 
 // vector is the part of a golden vector this reads: the entry before any
-// delegate wrapping, and the entry as it goes to the signer. Both are entries
-// the fuzz target can decode, and pre_wrap_entry_xdr is absent from most
-// vectors.
+// delegate wrapping, the entry as it goes to the signer, and the finished
+// signed entry. All three are entries the fuzz targets can decode, and
+// pre_wrap_entry_xdr is absent from most vectors. signed_entry_xdr is used by
+// the pair target, where a signature left in place over a moved payload is the
+// case worth starting from.
 type vector struct {
 	PreWrapEntryXDR  string `json:"pre_wrap_entry_xdr"`
 	UnsignedEntryXDR string `json:"unsigned_entry_xdr"`
+	SignedEntryXDR   string `json:"signed_entry_xdr"`
 }
 
-// targets is the list of fuzz targets that use entry bytes as input.
+// targets is the list of fuzz targets that take a single entry as input.
 var targets = []string{
 	"FuzzValidateDelegateOrder",
 	"FuzzInspect",
 	"FuzzPreimage",
 	"FuzzDecodeAuthorizationEntry",
+	"FuzzVerifyEntry",
 }
+
+// pairTarget is the one fuzz target that takes two entries. Its seeds carry two
+// []byte literals, one per argument, so they are written by writePairSeeds
+// rather than the single-input loop above and are listed in the expectations as
+// not replayed: the wasm core decodes and hashes one entry at a time and has no
+// DiffEntries surface to replay a pair through.
+const pairTarget = "FuzzDiffEntries"
 
 // fuzzOperation maps a fuzz target's seed directory to the wasm entry point its
 // seeds are replayed through by wasm/parity.mjs. The wasm core exposes only
@@ -110,6 +125,7 @@ var fuzzOperation = map[string]string{
 	"FuzzInspect":                  "preimage",
 	"FuzzPreimage":                 "preimage",
 	"FuzzDecodeAuthorizationEntry": "preimage",
+	"FuzzVerifyEntry":              "preimage",
 	"FuzzPayload":                  "payload",
 }
 
@@ -204,6 +220,14 @@ func run() error {
 		return fmt.Errorf("writing payload seeds: %w", err)
 	}
 
+	// The two-input DiffEntries target: entry pairs built from the vectors and
+	// their tampered variants.
+	pairWritten, err := writePairSeeds(names)
+	if err != nil {
+		return fmt.Errorf("writing %s seeds: %w", pairTarget, err)
+	}
+	totalWritten += pairWritten
+
 	// Record the native result for every seed now on disk, including a
 	// committed crash reproducer gencorpus did not write. Done last, after
 	// every seed directory is populated, so the expectations always describe
@@ -219,10 +243,155 @@ func run() error {
 }
 
 // corpusFile renders one seed in Go's fuzz corpus format: the version header,
-// then one Go literal per argument of the fuzz function. All targets take
-// a single []byte, so there is one literal.
-func corpusFile(data []byte) []byte {
-	return []byte("go test fuzz v1\n[]byte(" + strconv.Quote(string(data)) + ")\n")
+// then one Go literal per argument of the fuzz function. Most targets take a
+// single []byte, so there is one literal; FuzzDiffEntries takes two and gets
+// two, one per line.
+func corpusFile(args ...[]byte) []byte {
+	var b strings.Builder
+	b.WriteString("go test fuzz v1\n")
+	for _, arg := range args {
+		b.WriteString("[]byte(")
+		b.WriteString(strconv.Quote(string(arg)))
+		b.WriteString(")\n")
+	}
+	return []byte(b.String())
+}
+
+// writePairSeeds builds the seed corpus for the two-input DiffEntries target.
+// For each golden vector it pairs the entry against itself (the identical
+// case), the signed entry against the same entry with its signature expiration
+// advanced (the stale-signature case: the payload moves while the signature
+// stays put), and the unsigned entry against its delegate-wrapped form where
+// the vector has one. Every pair is drawn from bytes the golden vectors already
+// commit, so the fuzzer mutates from real entries rather than discovering their
+// shape. The pair files carry two []byte literals, which is why they are
+// written here and not by the single-input loop.
+func writePairSeeds(names []string) (int, error) {
+	outDir := filepath.Join(fuzzDir, pairTarget)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return 0, fmt.Errorf("creating %s: %w", outDir, err)
+	}
+	if err := clearGenerated(outDir, pairTarget); err != nil {
+		return 0, err
+	}
+
+	type pair struct {
+		name string
+		a, b []byte
+	}
+	var pairs []pair
+	for _, name := range names {
+		path := filepath.Join(vectorsDir, name)
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return 0, fmt.Errorf("reading %s: %w", path, err)
+		}
+		var v vector
+		if err := json.Unmarshal(raw, &v); err != nil {
+			return 0, fmt.Errorf("parsing %s: %w", path, err)
+		}
+		stem := name[:len(name)-len(".json")]
+
+		unsigned, err := decodeEntry(v.UnsignedEntryXDR, path)
+		if err != nil {
+			return 0, err
+		}
+		preWrap, err := decodeEntry(v.PreWrapEntryXDR, path)
+		if err != nil {
+			return 0, err
+		}
+		signed, err := decodeEntry(v.SignedEntryXDR, path)
+		if err != nil {
+			return 0, err
+		}
+
+		if len(unsigned) > 0 {
+			pairs = append(pairs, pair{name: stem + "_identical", a: unsigned, b: unsigned})
+		}
+		if len(signed) > 0 {
+			pairs = append(pairs, pair{name: stem + "_signed_identical", a: signed, b: signed})
+			if tampered, ok := movedExpiration(signed); ok {
+				pairs = append(pairs, pair{name: stem + "_signed_stale", a: signed, b: tampered})
+			}
+		}
+		if len(unsigned) > 0 && len(preWrap) > 0 && !bytes.Equal(unsigned, preWrap) {
+			pairs = append(pairs, pair{name: stem + "_prewrap", a: unsigned, b: preWrap})
+		}
+	}
+
+	var writtenNames []string
+	for _, p := range pairs {
+		outPath := filepath.Join(outDir, p.name)
+		if err := os.WriteFile(outPath, corpusFile(p.a, p.b), 0o644); err != nil {
+			return 0, fmt.Errorf("writing %s: %w", outPath, err)
+		}
+		writtenNames = append(writtenNames, p.name)
+	}
+	if err := writeManifest(pairTarget, writtenNames); err != nil {
+		return 0, fmt.Errorf("writing the %s manifest: %w", pairTarget, err)
+	}
+
+	fmt.Printf("wrote %d seeds for %s into %s\n", len(pairs), pairTarget, outDir)
+	return len(pairs), nil
+}
+
+// clearGenerated removes the files a previous run recorded in the target's
+// manifest, leaving anything else — in particular a committed crash reproducer
+// sharing the directory — untouched.
+func clearGenerated(outDir, target string) error {
+	for _, name := range manifestNames(filepath.Join(manifestDir, target)) {
+		if err := os.Remove(filepath.Join(outDir, name)); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("clearing %s: %w", filepath.Join(outDir, name), err)
+		}
+	}
+	return nil
+}
+
+// decodeEntry decodes an optional base64 entry, returning nil for a field the
+// vector omits. name is only used in the error message.
+func decodeEntry(encoded, name string) ([]byte, error) {
+	if encoded == "" {
+		return nil, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decoding an entry of %s: %w", name, err)
+	}
+	return decoded, nil
+}
+
+// movedExpiration deep-copies an address-credentialed entry and advances its
+// signature expiration ledger by one, so the preimage and payload move while
+// whatever signature the entry carries stays put — the stale-signature pair the
+// diff has to report. It reports false for a source-account entry, which has no
+// such field.
+func movedExpiration(encoded []byte) ([]byte, bool) {
+	var entry xdr.SorobanAuthorizationEntry
+	if err := entry.UnmarshalBinary(encoded); err != nil {
+		return nil, false
+	}
+
+	var credentials *xdr.SorobanAddressCredentials
+	switch entry.Credentials.Type {
+	case xdr.SorobanCredentialsTypeSorobanCredentialsAddress:
+		credentials = entry.Credentials.Address
+	case xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2:
+		credentials = entry.Credentials.AddressV2
+	case xdr.SorobanCredentialsTypeSorobanCredentialsAddressWithDelegates:
+		if entry.Credentials.AddressWithDelegates != nil {
+			credentials = &entry.Credentials.AddressWithDelegates.AddressCredentials
+		}
+	}
+	if credentials == nil {
+		return nil, false
+	}
+
+	credentials.SignatureExpirationLedger++
+	tampered, err := entry.MarshalBinary()
+	if err != nil {
+		return nil, false
+	}
+	return tampered, true
 }
 
 func writePayloadSeeds() error {
@@ -317,6 +486,13 @@ type expectationsFile struct {
 	Note              string `json:"note"`
 	ValidUntilLedger  uint32 `json:"valid_until_ledger"`
 	NetworkPassphrase string `json:"network_passphrase"`
+	// NonReplayedTargets names seed directories the harness must not require a
+	// replay expectation for. FuzzDiffEntries takes two entries per seed and
+	// the wasm core exposes no pair surface, so its seeds are generated for
+	// the native fuzzer only. Keeping the list in the document, rather than
+	// hardcoding it in the harness, means the two cannot disagree about which
+	// target that is.
+	NonReplayedTargets []string `json:"non_replayed_targets"`
 	// Cases is keyed by "<Target>/<seed file name>", the same key the harness
 	// derives from the seed corpus, so a seed and its expectation cannot drift.
 	Cases map[string]expectation `json:"cases"`
@@ -350,11 +526,12 @@ func writeExpectations() (int, error) {
 	}
 
 	doc := expectationsFile{
-		SchemaVersion:     1,
-		Note:              "Native Go results for the fuzz seed corpus, replayed by wasm/parity.mjs. Generated by cmd/gencorpus; never edit by hand. Status \"reject\" means the native build refused the input and the wasm build must refuse it too.",
-		ValidUntilLedger:  testValidUntilLedger,
-		NetworkPassphrase: testNetworkPassphrase,
-		Cases:             cases,
+		SchemaVersion:      2,
+		Note:               "Native Go results for the fuzz seed corpus, replayed by wasm/parity.mjs. Generated by cmd/gencorpus; never edit by hand. Status \"reject\" means the native build refused the input and the wasm build must refuse it too. Targets in non_replayed_targets take more than one entry per seed; the wasm core has no surface to replay them through, so they are native-only.",
+		ValidUntilLedger:   testValidUntilLedger,
+		NetworkPassphrase:  testNetworkPassphrase,
+		NonReplayedTargets: []string{pairTarget},
+		Cases:              cases,
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -370,9 +547,10 @@ func writeExpectations() (int, error) {
 	return len(cases), nil
 }
 
-// readSeedFile parses the raw []byte out of a Go fuzz corpus file. Every seed
-// gencorpus writes has exactly one []byte literal on the second line, and so
-// does every reproducer the Go fuzzer writes.
+// readSeedFile parses the raw []byte out of a single-input Go fuzz corpus file.
+// Every seed of a target in fuzzOperation has exactly one []byte literal on the
+// second line, and so does every reproducer the Go fuzzer writes. The two-input
+// DiffEntries target is not in fuzzOperation and is never read here.
 func readSeedFile(path string) ([]byte, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {

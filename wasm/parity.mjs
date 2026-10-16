@@ -13,6 +13,11 @@
 //     fuzz_expectations.json, the native result cmd/gencorpus recorded for each
 //     seed.
 //
+// The two-input DiffEntries fuzz target is the one corpus the harness does not
+// replay: the wasm core decodes and hashes a single entry at a time and has no
+// DiffEntries surface, so those seeds are listed in the expectations as
+// non_replayed_targets and counted as skipped with that reason.
+//
 // The wasm build is a second compilation of the same Go code under a different
 // toolchain and a different integer and memory model. The vectors and the
 // differential corpus are cases someone generated once; the fuzz corpus is the
@@ -156,26 +161,35 @@ function loadJSONDir(dir) {
   return names.map((n) => ({ file: join(dir, n), json: JSON.parse(readFileSync(join(dir, n), "utf8")) }));
 }
 
-// readSeedFile parses the raw []byte out of a Go fuzz corpus file, the same
-// values cmd/gencorpus wrote. The header and single literal are the whole
-// format; anything else is an error rather than a silent skip.
-function readSeedFile(path) {
+// readSeedArgs parses every []byte literal out of a Go fuzz corpus file, the
+// values cmd/gencorpus wrote: one per argument of the target's fuzz function.
+// A single-input target has one; the two-input DiffEntries target has two.
+// Anything that is not a []byte literal is an error rather than a silent skip.
+function readSeedArgs(path) {
   const lines = readFileSync(path, "utf8").split("\n");
   if (lines[0] !== "go test fuzz v1") {
     throw new Error(`not a Go fuzz corpus file (missing "go test fuzz v1" header): ${path}`);
   }
-  const literal = (lines[1] ?? "").trim();
   const prefix = "[]byte(";
-  if (!literal.startsWith(prefix) || !literal.endsWith(")")) {
-    throw new Error(`unsupported argument literal in ${path}: ${literal}`);
+  const args = [];
+  for (const raw of lines.slice(1)) {
+    const literal = raw.trim();
+    if (literal === "") continue;
+    if (!literal.startsWith(prefix) || !literal.endsWith(")")) {
+      throw new Error(`unsupported argument literal in ${path}: ${literal}`);
+    }
+    const quoted = literal.slice(prefix.length, -1);
+    if (!quoted.startsWith('"') || !quoted.endsWith('"')) {
+      throw new Error(`unsupported argument literal in ${path}: ${literal}`);
+    }
+    // The literal body is a Go string (strconv.Quote output); goUnquote
+    // recovers the exact bytes it encodes.
+    args.push(goUnquote(quoted.slice(1, -1)));
   }
-  const quoted = literal.slice(prefix.length, -1);
-  if (!quoted.startsWith('"') || !quoted.endsWith('"')) {
-    throw new Error(`unsupported argument literal in ${path}: ${literal}`);
+  if (args.length === 0) {
+    throw new Error(`no []byte argument in ${path}`);
   }
-  // The literal body is a Go string (strconv.Quote output); goUnquote recovers
-  // the exact bytes it encodes.
-  return goUnquote(quoted.slice(1, -1));
+  return args;
 }
 
 // goUnquote decodes the body of a Go double-quoted string literal. Go's \xNN
@@ -355,23 +369,42 @@ function fuzzMatch(api, exp, dataB64) {
   }
 }
 
-// fuzzCases pairs every seed on disk with its recorded expectation. A seed with
-// no expectation is an error, not a skip: that would be a case the harness
-// silently stopped checking.
+// fuzzCases pairs every replayed seed on disk with its recorded expectation. A
+// replayed seed with no expectation is an error, not a skip: that would be a
+// case the harness silently stopped checking. A seed directory named in
+// non_replayed_targets is the exception: its seeds carry more than one entry,
+// and the wasm core exposes no surface to replay a pair through, so they are
+// counted as skipped with that reason rather than quietly dropped. A
+// single-input directory the expectations do not describe is still an error, so
+// adding a target cannot silently shrink the replay.
 function fuzzCases(fuzzDir, expectations) {
   const { cases } = expectations;
+  const nonReplayed = new Set(expectations.non_replayed_targets ?? []);
   const out = [];
+  const skipped = [];
   for (const target of readdirSync(fuzzDir, { withFileTypes: true })) {
     if (!target.isDirectory() || target.name.startsWith(".")) continue;
     const dir = join(fuzzDir, target.name);
+    const declaredNonReplayed = nonReplayed.has(target.name);
     for (const seed of readdirSync(dir).sort()) {
       const key = `${target.name}/${seed}`;
+      const args = readSeedArgs(join(dir, seed));
+      if (declaredNonReplayed) {
+        skipped.push(key);
+        continue;
+      }
+      if (args.length !== 1) {
+        throw new Error(
+          `${key} carries ${args.length} arguments; the wasm binding replays single-input seeds only, ` +
+            `so ${target.name} must be listed in non_replayed_targets by cmd/gencorpus`,
+        );
+      }
       const exp = cases[key];
       if (!exp) throw new Error(`no native expectation recorded for ${key}; run cmd/gencorpus`);
-      out.push({ key, exp, dataB64: Buffer.from(readSeedFile(join(dir, seed))).toString("base64") });
+      out.push({ key, exp, dataB64: args[0].toString("base64") });
     }
   }
-  return out;
+  return { cases: out, skipped };
 }
 
 async function main() {
@@ -384,7 +417,7 @@ async function main() {
   const differentialByDir = differential.map((dir) => ({ dir, cases: loadJSONDir(dir) }));
   const differentialCases = differentialByDir.flatMap((d) => d.cases);
   const expectations = JSON.parse(readFileSync(expectationsPath, "utf8"));
-  const seeds = fuzzCases(fuzz, expectations);
+  const { cases: seeds, skipped: skippedSeeds } = fuzzCases(fuzz, expectations);
 
   console.log("WebAssembly parity harness");
   console.log(`wasm:         ${wasm}`);
@@ -393,6 +426,12 @@ async function main() {
     console.log(`differential: ${dir} (${cases.length})`);
   }
   console.log(`fuzz:         ${fuzz} + ${expectationsPath} (${seeds.length})`);
+  if (skippedSeeds.length > 0) {
+    console.log(
+      `fuzz skipped: ${skippedSeeds.length} pair seeds the single-input wasm binding cannot replay ` +
+        `(${[...new Set(skippedSeeds.map((k) => k.split("/")[0]))].join(", ")})`,
+    );
+  }
   console.log(`budget:       ${budgetMs} ms`);
 
   const api = await loadRuntime(wasm);

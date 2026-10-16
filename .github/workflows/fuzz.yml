@@ -60,6 +60,12 @@ jobs:
           - target: FuzzDecodeAuthorizationEntry
             package: .
             corpus: testdata/fuzz/FuzzDecodeAuthorizationEntry
+          - target: FuzzVerifyEntry
+            package: .
+            corpus: testdata/fuzz/FuzzVerifyEntry
+          - target: FuzzDiffEntries
+            package: .
+            corpus: testdata/fuzz/FuzzDiffEntries
           - target: FuzzCopyRoundTrip
             package: ./internal/xdrcopy
             corpus: internal/xdrcopy/testdata/fuzz/FuzzCopyRoundTrip

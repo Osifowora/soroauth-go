@@ -681,3 +681,91 @@ func TestDiffEntriesRefusesPathologicalNesting(t *testing.T) {
 		t.Fatalf("a tree within the limit was refused: %v", err)
 	}
 }
+
+// FuzzDiffEntries feeds two decoded entries into DiffEntries and asserts the
+// claims EntryDiff makes rather than only that nothing panics. DiffEntries walks
+// two untrusted trees at once and reports PayloadChanged, a verdict other code
+// acts on, so the payload cross-check below is the valuable assertion: it
+// re-derives the payload for both entries through Preimage/Payload and requires
+// PayloadChanged to agree, which tests the claim rather than the
+// implementation's opinion of itself.
+//
+// The committed corpus (cmd/gencorpus) carries the golden vectors and tampered
+// pairs; the in-code seeds add the two shapes that are easiest to build here.
+func FuzzDiffEntries(f *testing.F) {
+	// An entry against itself, and the dangerous tamper: a signature left in
+	// place while the payload moves underneath it.
+	entry := entryForArm(f, xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2, 42)
+	if raw, err := entry.MarshalBinary(); err == nil {
+		f.Add(raw, raw)
+	}
+	if raw, err := entry.MarshalBinary(); err == nil {
+		if bumped, err := xdrcopyEntry(f, entry); err == nil {
+			if credentials, err := addressCredentials(bumped.Credentials); err == nil {
+				credentials.SignatureExpirationLedger = xdr.Uint32(testValidUntilLedger + 1)
+				if tampered, err := bumped.MarshalBinary(); err == nil {
+					f.Add(raw, tampered)
+				}
+			}
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, a, b []byte) {
+		var entryA, entryB xdr.SorobanAuthorizationEntry
+		if err := entryA.UnmarshalBinary(a); err != nil {
+			return
+		}
+		if err := entryB.UnmarshalBinary(b); err != nil {
+			return
+		}
+
+		// Fixed point: an entry against itself is identical with no changes.
+		self, err := DiffEntries(entryA, entryA)
+		if err != nil {
+			return
+		}
+		if !self.Identical || self.PayloadChanged || self.SignaturesChanged ||
+			len(self.Changes) != 0 || len(self.StaleSignatures) != 0 {
+			t.Errorf("DiffEntries(e, e) = %+v, want Identical with no changes", self)
+		}
+
+		diff, err := DiffEntries(entryA, entryB)
+		if err != nil {
+			return
+		}
+
+		// Identical must agree with the byte comparison the result is named for.
+		equal, err := xdrEqual(entryA, entryB)
+		if err == nil && diff.Identical != equal {
+			t.Errorf("Identical=%v but the entries encode equally=%v", diff.Identical, equal)
+		}
+
+		// A signature can only be stale if the payload moved; when it did not,
+		// no signature can have committed to an old payload.
+		if !diff.PayloadChanged && len(diff.StaleSignatures) != 0 {
+			t.Errorf("PayloadChanged=false but StaleSignatures=%v", diff.StaleSignatures)
+		}
+
+		// The payload cross-check. It is only meaningful where the payload
+		// exists: a source-account entry has none, so a pair involving one is
+		// handled by the arm-difference branch rather than skipped silently.
+		payloadA, okA, errA := independentPayload(entryA)
+		payloadB, okB, errB := independentPayload(entryB)
+		if errA != nil || errB != nil {
+			return
+		}
+		switch {
+		case okA && okB:
+			if want := payloadA != payloadB; diff.PayloadChanged != want {
+				t.Errorf("PayloadChanged=%v, but Preimage/Payload differ=%v", diff.PayloadChanged, want)
+			}
+		case okA != okB:
+			if !diff.PayloadChanged {
+				t.Errorf("one entry carries a payload and the other does not, but PayloadChanged=false")
+			}
+		default:
+			// Both source-account: no payload exists to compare, and the diff
+			// still reports the invocation difference it found.
+		}
+	})
+}

@@ -323,18 +323,21 @@ func verifyNode(signature xdr.ScVal, encoded []byte, payload [32]byte) (NodeVerd
 
 	verdict := NodeVerdict{Address: formatted}
 
-	if !isSigned(signature) {
-		verdict.Verdict = VerdictUnsigned
-		verdict.Reason = "the node carries no signature (Void or an empty vector)"
-		return verdict, nil
-	}
-
-	// A node addressed to a contract can never be decided here: the value it
-	// holds is whatever that contract's __check_auth expects, and it may well
-	// not be the classic account shape at all.
+	// A node addressed to a contract is decided before the unsigned check: the
+	// value it holds is whatever that contract's __check_auth expects, and a
+	// placeholder may itself be meaningful to the contract. The engine cannot
+	// say anything about it, so it is always cannot_check — never unsigned,
+	// which would claim the node is simply unfilled, and never verified, which
+	// is the one verdict this library must never produce wrongly.
 	if address.Type != xdr.ScAddressTypeScAddressTypeAccount {
 		verdict.Verdict = VerdictCannotCheck
 		verdict.Reason = contractAccountNote
+		return verdict, nil
+	}
+
+	if !isSigned(signature) {
+		verdict.Verdict = VerdictUnsigned
+		verdict.Reason = "the node carries no signature (Void or an empty vector)"
 		return verdict, nil
 	}
 

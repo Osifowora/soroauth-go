@@ -389,6 +389,57 @@ func TestVerifyEntryCannotCheckAContractNode(t *testing.T) {
 	}
 }
 
+// TestVerifyEntryCannotCheckAnUnsignedContractNode pins the precedence the
+// contract-address rule has over the placeholder rule: a C… node is
+// cannot_check whatever its signature, including the Void and empty-vector
+// placeholders that would be "unsigned" on an account node. The docs list a
+// contract node under cannot_check and a placeholder under unsigned; this is
+// the case where both descriptions fit and the contract one wins, because a
+// placeholder handed to __check_auth may itself be meaningful.
+func TestVerifyEntryCannotCheckAnUnsignedContractNode(t *testing.T) {
+	contractAddress, err := ParseAddress(testContractAddress(t, "verify-unsigned-contract-address"))
+	if err != nil {
+		t.Fatalf("ParseAddress: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		signature xdr.ScVal
+	}{
+		{name: "void", signature: xdr.ScVal{Type: xdr.ScValTypeScvVoid}},
+		{name: "empty vector", signature: scVec()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			credentials := xdr.SorobanAddressCredentials{
+				Address:                   contractAddress,
+				Nonce:                     12,
+				SignatureExpirationLedger: 0,
+				Signature:                 tt.signature,
+			}
+			entry := xdr.SorobanAuthorizationEntry{
+				Credentials:    xdr.SorobanCredentials{Type: xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2, AddressV2: &credentials},
+				RootInvocation: testInvocation(t),
+			}
+
+			report, err := VerifyEntry(entry, network.TestNetworkPassphrase)
+			if err != nil {
+				t.Fatalf("VerifyEntry: %v", err)
+			}
+			if len(report.Nodes) != 1 {
+				t.Fatalf("got %d nodes, want 1", len(report.Nodes))
+			}
+			if report.Nodes[0].Verdict != VerdictCannotCheck {
+				t.Errorf("verdict = %q (%s), want %q", report.Nodes[0].Verdict, report.Nodes[0].Reason, VerdictCannotCheck)
+			}
+			if report.HasUnsignedNodes() {
+				t.Error("a contract node was reported unsigned; it must be cannot_check")
+			}
+		})
+	}
+}
+
 // TestVerifyEntryNestedDelegateTree signs a top-level node plus a delegate that
 // itself has a nested delegate, and checks that every node is reached.
 func TestVerifyEntryNestedDelegateTree(t *testing.T) {
@@ -516,4 +567,192 @@ func scMapVal() xdr.ScVal {
 func scI64(v int64) xdr.ScVal {
 	value := xdr.Int64(v)
 	return xdr.ScVal{Type: xdr.ScValTypeScvI64, I64: &value}
+}
+
+// independentPayload rebuilds the payload exactly the way VerifyEntry does but
+// standalone, so the fuzz target can re-verify a `verified` verdict rather than
+// trusting the engine's own word for it. hasPayload is false for the
+// source-account arm, which has no payload of its own.
+func independentPayload(entry xdr.SorobanAuthorizationEntry) (payload [32]byte, hasPayload bool, err error) {
+	if entry.Credentials.Type == xdr.SorobanCredentialsTypeSorobanCredentialsSourceAccount {
+		return [32]byte{}, false, nil
+	}
+	credentials, err := addressCredentials(entry.Credentials)
+	if err != nil {
+		return [32]byte{}, false, err
+	}
+	preimage, err := Preimage(entry, uint32(credentials.SignatureExpirationLedger), network.TestNetworkPassphrase)
+	if err != nil {
+		return [32]byte{}, false, err
+	}
+	payload, err = Payload(preimage)
+	if err != nil {
+		return [32]byte{}, false, err
+	}
+	return payload, true, nil
+}
+
+// FuzzVerifyEntry feeds arbitrary entry bytes through VerifyEntry and checks the
+// guarantees docs/verification-limits.md states, as invariants:
+//
+//   - It never reports verified for a signature crypto/ed25519 rejects. A
+//     verified verdict is independently re-checked here, so a false verified —
+//     the worst output this library can produce — cannot pass unnoticed.
+//   - An invalid verdict corresponds to a readable signature ed25519 rejects,
+//     and a cannot_check verdict on an account node to a signature the account
+//     shape cannot read.
+//   - A node addressed to a C… contract is always cannot_check, whatever its
+//     signature value, and never verified.
+//   - Malformed, truncated and wrong-type signature values produce a verdict
+//     rather than a panic; a panic is a fuzz finding by construction.
+//
+// The golden vectors are the committed seeds (cmd/gencorpus); this target adds
+// corrupted signature shapes on top, which are the inputs a decoder written to
+// assume well-formed signatures would break on.
+func FuzzVerifyEntry(f *testing.F) {
+	// Seed with a realistic signed entry, then the corrupted variants. The
+	// helpers take testing.TB, which *testing.F satisfies; a &testing.T{}
+	// literal would panic on Helper/Fatalf rather than report a bad seed.
+	entry := entryForArm(f, xdr.SorobanCredentialsTypeSorobanCredentialsAddressV2, 42)
+	signer := NewEd25519Signer(testKeypair(f, "soroauth-preimage-signer"))
+	if signed, err := AuthorizeEntry(context.Background(), entry, signer, testValidUntilLedger, network.TestNetworkPassphrase); err == nil {
+		if raw, err := signed.MarshalBinary(); err == nil {
+			f.Add(raw)
+		}
+		for _, corrupt := range corruptSignatureShapes(f, signed) {
+			f.Add(corrupt)
+		}
+	}
+
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var entry xdr.SorobanAuthorizationEntry
+		if err := entry.UnmarshalBinary(data); err != nil {
+			return
+		}
+
+		report, err := VerifyEntry(entry, network.TestNetworkPassphrase)
+		if err != nil {
+			// An unsupported credentials arm, or a body this engine refuses,
+			// is a clean error and not a report. A refusal is safe.
+			return
+		}
+
+		if entry.Credentials.Type == xdr.SorobanCredentialsTypeSorobanCredentialsSourceAccount {
+			if len(report.Nodes) != 0 {
+				t.Errorf("source-account entry reported %d nodes, want 0", len(report.Nodes))
+			}
+			return
+		}
+
+		nodes, err := credentialNodes(&entry)
+		if err != nil {
+			t.Fatalf("VerifyEntry returned a report but the credential nodes are unreadable: %v", err)
+		}
+		if len(report.Nodes) != len(nodes) {
+			t.Fatalf("VerifyEntry reported %d nodes, credentialNodes found %d", len(report.Nodes), len(nodes))
+		}
+
+		payload, hasPayload, err := independentPayload(entry)
+		if err != nil {
+			t.Fatalf("VerifyEntry returned a report but the payload will not rebuild: %v", err)
+		}
+		if !hasPayload {
+			t.Fatal("a non-source entry produced no payload")
+		}
+
+		for i, verdict := range report.Nodes {
+			signature := *nodes[i].signature
+
+			var address xdr.ScAddress
+			if err := address.UnmarshalBinary(nodes[i].encoded); err != nil {
+				t.Fatalf("node %d address will not decode: %v", i, err)
+			}
+
+			if address.Type != xdr.ScAddressTypeScAddressTypeAccount {
+				if verdict.Verdict != VerdictCannotCheck {
+					t.Errorf("contract node %d reported %q, want %q", i, verdict.Verdict, VerdictCannotCheck)
+				}
+				continue
+			}
+
+			switch verdict.Verdict {
+			case VerdictVerified:
+				publicKey, rawSignature, err := parseAccountSignature(signature)
+				if err != nil {
+					t.Fatalf("node %d reported verified but its shape is unreadable: %v", i, err)
+				}
+				if !ed25519.Verify(ed25519.PublicKey(publicKey), payload[:], rawSignature) {
+					t.Errorf("node %d reported verified but crypto/ed25519 rejects the signature", i)
+				}
+			case VerdictInvalid:
+				publicKey, rawSignature, err := parseAccountSignature(signature)
+				if err != nil {
+					t.Fatalf("node %d reported invalid but its shape is unreadable: %v", i, err)
+				}
+				if ed25519.Verify(ed25519.PublicKey(publicKey), payload[:], rawSignature) {
+					t.Errorf("node %d reported invalid but crypto/ed25519 accepts the signature", i)
+				}
+			case VerdictUnsigned:
+				if isSigned(signature) {
+					t.Errorf("node %d reported unsigned but carries a signature", i)
+				}
+			case VerdictCannotCheck:
+				if _, _, err := parseAccountSignature(signature); err == nil {
+					t.Errorf("node %d reported cannot_check for a readable account signature", i)
+				}
+			default:
+				t.Errorf("node %d reported an unknown verdict %q", i, verdict.Verdict)
+			}
+		}
+	})
+}
+
+// corruptSignatureShapes returns a signed entry re-encoded with a range of
+// malformed, truncated and wrong-type signature values, the inputs
+// docs/verification-limits.md says must produce a verdict and never a panic.
+func corruptSignatureShapes(t testing.TB, signed xdr.SorobanAuthorizationEntry) [][]byte {
+	t.Helper()
+
+	shapes := []xdr.ScVal{
+		{Type: xdr.ScValTypeScvVoid},
+		scVec(),
+		scBytes([]byte("not the account shape")),
+		scI64(7),
+		scVec(scMapVal(), scMapVal()),
+		scVec(scMapVal()),
+		scVec(scSymbol("x")),
+	}
+
+	var out [][]byte
+	for _, shape := range shapes {
+		candidate, err := xdrcopyEntry(t, signed)
+		if err != nil {
+			continue
+		}
+		credentials, err := addressCredentials(candidate.Credentials)
+		if err != nil {
+			continue
+		}
+		credentials.Signature = shape
+		if raw, err := candidate.MarshalBinary(); err == nil {
+			out = append(out, raw)
+		}
+	}
+
+	// A truncated classic-account signature: a 31-byte public key and a
+	// 63-byte signature, which a length-check written with the wrong constant
+	// would accept.
+	publicKey := make([]byte, ed25519.PublicKeySize-1)
+	rawSignature := make([]byte, ed25519.SignatureSize-1)
+	truncated := scVec(accountSignature(publicKey, rawSignature))
+	if candidate, err := xdrcopyEntry(t, signed); err == nil {
+		if credentials, err := addressCredentials(candidate.Credentials); err == nil {
+			credentials.Signature = truncated
+			if raw, err := candidate.MarshalBinary(); err == nil {
+				out = append(out, raw)
+			}
+		}
+	}
+
+	return out
 }

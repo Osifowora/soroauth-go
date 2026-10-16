@@ -78,12 +78,18 @@ is a case that stopped being checked.
 
 The wasm core exposes `preimage` and `payload` only. Entry-shaped seeds are
 replayed through `preimage`; `FuzzPayload`'s raw bytes are replayed through
-`payload`. That means the `FuzzInspect`, `FuzzDecodeAuthorizationEntry` and
-`FuzzValidateDelegateOrder` seeds are exercised through the shared entry decoder
-and preimage path, not through those three functions: the harness proves the
-wasm build decodes and hashes them identically, and does not prove `Inspect` or
-the delegate-order check behave the same under wasm, because neither is part of
-the wasm surface.
+`payload`. That means the `FuzzInspect`, `FuzzDecodeAuthorizationEntry`,
+`FuzzValidateDelegateOrder` and `FuzzVerifyEntry` seeds are exercised through the
+shared entry decoder and preimage path, not through those four functions: the
+harness proves the wasm build decodes and hashes them identically, and does not
+prove `Inspect`, the delegate-order check or `VerifyEntry` behave the same under
+wasm, because none is part of the wasm surface.
+
+`FuzzDiffEntries` is not replayed at all. Its seeds carry two entries each and
+the wasm core has no `DiffEntries` surface, so the expectations file lists the
+target under `non_replayed_targets` and the harness counts its seeds as skipped
+with that reason. The list is written by `cmd/gencorpus` rather than hardcoded
+in the harness, so the two cannot disagree about which target it names.
 
 For the same reason the golden vector signed by a classic-account multisig
 (`v2_account_multisig_20_signatures`) is reported as skipped: the binding's
