@@ -79,11 +79,11 @@ is a case that stopped being checked.
 The wasm core exposes `preimage` and `payload` only. Entry-shaped seeds are
 replayed through `preimage`; `FuzzPayload`'s raw bytes are replayed through
 `payload`. That means the `FuzzInspect`, `FuzzDecodeAuthorizationEntry`,
-`FuzzValidateDelegateOrder` and `FuzzVerifyEntry` seeds are exercised through the
-shared entry decoder and preimage path, not through those four functions: the
-harness proves the wasm build decodes and hashes them identically, and does not
-prove `Inspect`, the delegate-order check or `VerifyEntry` behave the same under
-wasm, because none is part of the wasm surface.
+`FuzzValidateDelegateOrder` and `FuzzVerifyEntry` seeds are exercised through
+the shared entry decoder and preimage path, not through those four functions:
+the harness proves the wasm build decodes and hashes them identically, and does
+not prove `Inspect`, the delegate-order check or `VerifyEntry` behave the same
+under wasm, because none is part of the wasm surface.
 
 `FuzzDiffEntries` is not replayed at all. Its seeds carry two entries each and
 the wasm core has no `DiffEntries` surface, so the expectations file lists the

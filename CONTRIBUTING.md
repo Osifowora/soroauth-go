@@ -808,10 +808,10 @@ deterministic test to narrow it down.
 
 ### Fuzzing
 
-The full story lives in [docs/fuzzing.md](docs/fuzzing.md): the eight targets and
-the property each asserts, the nightly `continuous-fuzz` workflow that runs them
-beyond CI's time budget, and the crash-to-regression-seed process. What follows
-is what you need while working.
+The full story lives in [docs/fuzzing.md](docs/fuzzing.md): the eight targets
+and the property each asserts, the nightly `continuous-fuzz` workflow that runs
+them beyond CI's time budget, and the crash-to-regression-seed process. What
+follows is what you need while working.
 
 The short loop:
 
